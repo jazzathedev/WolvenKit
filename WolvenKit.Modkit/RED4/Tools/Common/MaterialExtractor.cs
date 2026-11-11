@@ -543,7 +543,16 @@ public partial class MaterialExtractor
 
             foreach (var import in imports)
             {
-                ExtractResource(new CResourceReference<CResource>(import.DepotPath, import.Flags), "");
+                // A single unreadable import (some game .mlsetup files reference textures that do not exist) should not
+                // fail the whole resource: the caller would replace e.g. the material's MultilayerSetup with the engine default.
+                try
+                {
+                    ExtractResource(new CResourceReference<CResource>(import.DepotPath, import.Flags), "");
+                }
+                catch (Exception ex)
+                {
+                    _loggerService.Warning($"{file.MetaData.FileName}: skipped import {import.DepotPath.GetResolvedText()}: {ex.Message}");
+                }
             }
         }
     }
