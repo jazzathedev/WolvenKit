@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using Microsoft.ClearScript;
@@ -475,16 +476,18 @@ public class AppScriptFunctions : ScriptFunctions
 
     /// <summary>
     /// Exports a list of files as you would with the export tool.
+    /// Returns only when every export has finished, so a script can rely on the exported files existing afterwards.
+    /// Exports run in parallel, limited to the number of processor cores.
     /// </summary>
     /// <param name="fileList"></param>
     /// <param name="defaultSettings"></param>
-    /// <param name="blocking"></param>
-    public void ExportFiles(IList fileList, ScriptObject? defaultSettings = null)
+    /// <returns>true when every file was exported successfully</returns>
+    public bool ExportFiles(IList fileList, ScriptObject? defaultSettings = null)
     {
         if (_projectManager.ActiveProject is not { } proj)
         {
             _loggerService.Error("No project loaded");
-            return;
+            return false;
         }
 
         var fileDict = new Dictionary<FileInfo, GlobalExportArgs>();
@@ -514,17 +517,32 @@ public class AppScriptFunctions : ScriptFunctions
             _loggerService.Warning($"\"{entry}\" is not a valid entry");
         }
 
-        Parallel.ForEach(fileDict, (kvp) =>
+        // Wait for every export instead of starting fire-and-forget tasks: scripts otherwise finish (and users close
+        // WolvenKit) while files are still being written, and an unbounded number of exports at once can run out of memory.
+        var failed = 0;
+        var parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount };
+        Parallel.ForEach(fileDict, parallelOptions, (kvp) =>
         {
-            if (kvp.Value.Get<MeshExportArgs>().MeshExporter == MeshExporterType.REDmod)
+            bool success;
+            try
             {
-                Task.Run(() => _importExportHelper.Export(new DirectoryInfo(proj.ModDirectory), kvp.Key, new DirectoryInfo(proj.RawDirectory), kvp.Value.Get<MeshExportArgs>()));
+                success = kvp.Value.Get<MeshExportArgs>().MeshExporter == MeshExporterType.REDmod
+                    ? _importExportHelper.Export(new DirectoryInfo(proj.ModDirectory), kvp.Key, new DirectoryInfo(proj.RawDirectory), kvp.Value.Get<MeshExportArgs>()).GetAwaiter().GetResult()
+                    : _importExportHelper.Export(kvp.Key, kvp.Value, new DirectoryInfo(proj.ModDirectory), new DirectoryInfo(proj.RawDirectory)).GetAwaiter().GetResult();
             }
-            else
+            catch (Exception ex)
             {
-                Task.Run(() => _importExportHelper.Export(kvp.Key, kvp.Value, new DirectoryInfo(proj.ModDirectory), new DirectoryInfo(proj.RawDirectory)));
+                _loggerService.Error($"Failed to export {kvp.Key.Name}: {ex.Message}");
+                success = false;
+            }
+
+            if (!success)
+            {
+                Interlocked.Increment(ref failed);
             }
         });
+
+        return failed == 0;
 
         void AddFile(string filePath, ScriptObject? settings = null)
         {
